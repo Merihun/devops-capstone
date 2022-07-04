@@ -1,0 +1,369 @@
+version: 2.1
+orbs:
+  kubernetes: circleci/kubernetes@0.11.2
+
+commands:
+  setup-kubectl:
+    description: Install kubectl and setup proper kubeconfig cluster
+    steps:
+      - kubernetes/install-kubectl
+      - run:
+          name: Login to Kube config
+          command: |
+            aws eks --region ${AWS_DEFAULT_REGION} update-kubeconfig --name ${CLUSTER_NAME}
+
+  destroy-environments:
+    description: Destroy kubernetes deployments if any
+    parameters:
+      id:
+        type: string
+    steps:
+    - run:
+        name: Destroy environments
+        when: on_fail
+        command: |
+          if [[ $(kubectl get deployment/server-<< parameters.id >>) ]]; then
+            sed -e "s/{{ .DeploymentId }}/<< parameters.id >>/g" ~/project/infra/kubernetes/backend-deployment.yml | kubectl delete -f -
+          fi
+          
+          if [[ $(aws s3 ls s3://txmgmt-<< parameters.id >> 2>&1 | grep -c 'NoSuchBucket') = 0 ]]; then
+            aws s3 rm s3://txmgmt-<< parameters.id >> --recursive
+          fi
+          aws cloudformation delete-stack --stack-name TxMgmtFrontend-<< parameters.id >>
+
+  revert-migrations:
+    description: Revert the last migration if successfully run in the current workflow.
+    parameters:
+      key:
+        type: string 
+    steps:
+      - run:
+          name: Revert migrations
+          when: on_fail
+          command: |
+            SUCCESS=$(curl -H "token: ${MEMSTASH_TOKEN}" --request GET https://api.memstash.io/values/migrations-<< parameters.key >>)
+            if [[ $SUCCESS == "1" ]]; 
+            then
+              cd ~/project
+              npm install
+              npm run knex migrate:rollback -- --env production
+            fi
+
+  setup-aws-cli:
+    description: Download and installs aws cli v2
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -yy less
+      - run: curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+      - run: unzip awscliv2.zip
+      - run: sudo ./aws/install
+      - run: aws --version
+
+  export-backend-url:
+    description: Exports backends url as API_URL
+    parameters:
+      id:
+        type: string
+    steps:
+      - run: |
+          echo "export API_URL=http://$(kubectl get service/service-<< parameters.id >> --output=jsonpath='{.status.loadBalancer.ingress[0].hostname}')" >> $BASH_ENV
+          echo "export REACT_APP_API_URL=http://$(kubectl get service/service-<< parameters.id >> --output=jsonpath='{.status.loadBalancer.ingress[0].hostname}')" >> $BASH_ENV
+
+jobs:
+  build-frontend:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [frontend-build]
+      - run:
+          name: Build front-end
+          command: |
+            cd frontend
+            npm install
+            npm run build
+      - save_cache:
+          paths: [frontend/node_modules]
+          key: frontend-build 
+
+  build-backend:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [backend-build]
+      - run:
+          name: Back-end build
+          command: |
+            npm install
+            npm run build
+      - save_cache:
+          paths: [node_modules]
+          key: backend-build
+  
+  test-frontend:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [frontend-build]
+      - run:
+          name: Frontend Lint Test
+          command: |
+            cd ~/project/frontend
+            npm install
+            npm run lint
+      - run:
+          name: Frontend Unit test
+          command: |
+            cd ~/project/frontend
+            npm install
+            npm run test
+
+  test-backend:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [backend-build]
+      - run:
+          name: Backend Lint test
+          command: |
+            npm install
+            npm run lint
+      - run:
+          name: Backend Unit test
+          command: |
+            npm install
+            npm run test
+  
+  scan-frontend:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [frontend-build]
+      - run:
+          name: Scan frontend dependencies
+          command: |
+            cd ~/project/frontend
+            npm audit --audit-level=critical
+
+  scan-backend:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [backend-build]
+      - run:
+          name: Scan backend dependencies
+          command: |
+            npm audit --audit-level=critical
+  
+  run-migrations:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - setup-aws-cli
+      - restore_cache:
+          keys: [backend-build]
+      - run:
+          name: Run migrations
+          command: |
+            npm install
+            if [[ $(npm run knex migrate:latest -- --env production) =~ Batch\ [0-9]+\ run:\ [0-9]+\ migrations$ ]]; then
+              export MIGRATION_SUCCESS=1
+            fi
+      - run:
+          name: Send migration results to memstash
+          command: |
+            if [[ $MIGRATION_SUCCESS==1 ]]; then
+              curl -H "Content-Type: text/plain" -H "token: ${MEMSTASH_TOKEN}" \
+                --request PUT \
+                --data "1" \
+                https://api.memstash.io/values/migrations-${CIRCLE_WORKFLOW_ID}
+            fi
+      - revert-migrations:
+          key: ${CIRCLE_WORKFLOW_ID}
+
+  deploy-backend:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - setup_remote_docker
+      - setup-aws-cli
+      - setup-kubectl
+      - run:
+          name: Build Backend image
+          command: docker build -t perfectmak/txmgmt:${CIRCLE_WORKFLOW_ID} ~/project/
+      - run:
+          name: Publish Backend Image
+          command: |
+            docker login -u perfectmak -p ${DOCKER_API_KEY}
+            docker push perfectmak/txmgmt:${CIRCLE_WORKFLOW_ID}
+      - run:
+          name: Deploy backend
+          command: |
+            sed -e "s/{{ .DeploymentId }}/${CIRCLE_WORKFLOW_ID}/g" ~/project/infra/kubernetes/backend-deployment.yml | kubectl apply -f -
+          no_output_timeout: 30m
+      - revert-migrations:
+          key: ${CIRCLE_WORKFLOW_ID}
+      - destroy-environments:
+          id: ${CIRCLE_WORKFLOW_ID}
+  
+  deploy-frontend:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - setup_remote_docker
+      - setup-aws-cli
+      - setup-kubectl
+      - export-backend-url:
+          id: ${CIRCLE_WORKFLOW_ID}
+      - run:
+          name: Ensure front-end infrastructure exist
+          command: |
+            aws cloudformation deploy \
+              --template-file ~/project/infra/cloudformation/frontend.yml \
+              --stack-name TxMgmtFrontend-${CIRCLE_WORKFLOW_ID} \
+              --parameter-overrides ID="${CIRCLE_WORKFLOW_ID}"
+      - restore_cache:
+          keys: [frontend-build]
+      - run:
+          name: Deploy frontend objects
+          command: |
+            cd frontend
+            npm install
+            echo ${REACT_APP_API_URL}
+            npm run build
+            aws s3 cp ./build/ s3://txmgmt-${CIRCLE_WORKFLOW_ID} --recursive
+      - revert-migrations:
+          key: ${CIRCLE_WORKFLOW_ID}
+      - destroy-environments:
+          id: ${CIRCLE_WORKFLOW_ID}
+  
+  smoke-test:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - setup_remote_docker
+      - setup-aws-cli
+      - setup-kubectl
+      - export-backend-url:
+          id: ${CIRCLE_WORKFLOW_ID}
+      - run:
+          name: Backend smoke test.
+          command: |
+            echo "${API_URL}"
+            if [[ $(curl -X POST -d '{"query":"{ dummy }"}' -H 'Content-Type: application/json' $API_URL) == *"Sweet"* ]]
+            then
+              exit 0
+            else
+              exit 1
+            fi
+      - run:
+          name: Frontend smoke test.
+          command: |
+            APP_URL=http://txmgmt-${CIRCLE_WORKFLOW_ID}.s3-website-${AWS_DEFAULT_REGION}.amazonaws.com
+            if curl -s ${APP_URL} | grep "Transaction Mgmt"
+            then
+              exit 0
+            else
+              exit 1
+            fi
+      - destroy-environments:
+          id: ${CIRCLE_WORKFLOW_ID}
+      - revert-migrations:
+          key: ${CIRCLE_WORKFLOW_ID}
+
+  cloudfront-update:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - setup_remote_docker
+      - setup-aws-cli
+      - setup-kubectl
+      - run:
+          name: Cache Old Workflow Id
+          command: |
+            OldWorkflowID=$(aws cloudformation list-exports \
+              --query "Exports[?Name==\`WorkflowID\`].Value" \
+              --no-paginate --output text)
+
+            curl -H "Content-Type: text/plain" -H "token: ${MEMSTASH_TOKEN}" \
+              --request PUT \
+              --data "${OldWorkflowID}" \
+              https://api.memstash.io/values/old-id-${CIRCLE_WORKFLOW_ID}
+      - run:
+          name: Update cloudfront distribution
+          command: |
+            aws cloudformation update-stack \
+              --template-body=file://infra/cloudformation/cloudfront.yml \
+              --stack-name=TxMgmtCloudFront \
+              --parameters=ParameterKey=WorkflowID,ParameterValue=${CIRCLE_WORKFLOW_ID}
+      - revert-migrations:
+          key: ${CIRCLE_WORKFLOW_ID}
+
+  cleanup:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - setup_remote_docker
+      - setup-kubectl
+      - run:
+          name: Remove old stacks and files
+          command: |
+            OldWorkflowID=$(curl -H "token: ${MEMSTASH_TOKEN}" \
+              --request GET https://api.memstash.io/values/old-id-${CIRCLE_WORKFLOW_ID})
+
+            STACKS=($(aws cloudformation list-stacks \
+              --query "StackSummaries[*].StackName" \
+              --stack-status-filter CREATE_COMPLETE \
+              --no-paginate --output text))
+
+            if [[ "${STACKS[@]}" =~ "${OldWorkflowID}" ]]
+            then
+              sed -e "s/{{ .DeploymentId }}/${OldWorkflowID}/g" ~/project/infra/kubernetes/backend-deployment.yml | kubectl delete -f -
+              aws s3 rm "s3://txmgmt-${OldWorkflowID}" --recursive
+              aws cloudformation delete-stack --stack-name "TxMgmtFrontend-${OldWorkflowID}"
+            fi
+
+workflows:
+  default:
+    jobs:
+      - build-frontend
+      - build-backend
+      - test-frontend:
+          requires: [build-frontend]
+      - test-backend:
+          requires: [build-backend]
+      - scan-backend:
+          requires: [build-backend]
+      - scan-frontend:
+          requires: [build-frontend]
+      - run-migrations:
+          requires: [test-frontend, test-backend, scan-frontend, scan-backend]
+          filters:
+            branches:
+              only: [release]
+      - deploy-backend:
+          requires: [run-migrations]
+      - deploy-frontend:
+          requires: [deploy-backend]
+      - smoke-test:
+          requires: [deploy-backend, deploy-frontend]
+      - cloudfront-update:
+          requires: [smoke-test]
+      - cleanup:
+          requires: [cloudfront-update]
