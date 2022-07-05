@@ -1,6 +1,5 @@
 # Transaction's Management App
 
-[![CircleCI](https://circleci.com/gh/perfectmak/udacity-devops-capstone.svg?style=svg)](https://circleci.com/gh/perfectmak/udacity-devops-capstone)
 
 > This is my capstone project for the Udacity DevOps Nanodegree Program. Checkout the [infra](./infra) directory for more DevOps related details.
 
